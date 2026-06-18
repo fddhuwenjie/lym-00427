@@ -664,6 +664,8 @@ def list_clues(
 
 @app.get("/api/clues/{clue_id}", response_model=ClueDetailResponse)
 def get_clue(clue_id: int, db: Session = Depends(get_db)):
+    _refresh_overdue(db)
+
     clue = db.query(Clue).filter(Clue.id == clue_id).first()
     if not clue:
         raise HTTPException(status_code=404, detail="线索不存在")
@@ -762,18 +764,24 @@ def _update_overdue_for_clue(clue: Clue):
         clue.is_overdue = False
 
 
+def _refresh_overdue(db: Session):
+    now = datetime.utcnow()
+    clues = db.query(Clue).filter(
+        Clue.status == "active",
+        Clue.next_followup_at.isnot(None),
+        Clue.next_followup_at < now,
+        Clue.is_overdue == False,
+    ).all()
+    for clue in clues:
+        clue.is_overdue = True
+    if clues:
+        db.commit()
+
+
 def _check_overdue_internal(session_factory):
     db = session_factory()
     try:
-        now = datetime.utcnow()
-        clues = db.query(Clue).filter(
-            Clue.status == "active",
-            Clue.next_followup_at.isnot(None),
-            Clue.next_followup_at < now
-        ).all()
-        for clue in clues:
-            clue.is_overdue = True
-        db.commit()
+        _refresh_overdue(db)
     finally:
         db.close()
 
@@ -797,6 +805,8 @@ def check_overdue(db: Session = Depends(get_db)):
 
 @app.get("/api/clues/overdue/list", response_model=List[ClueResponse])
 def list_overdue_clues(db: Session = Depends(get_db)):
+    _refresh_overdue(db)
+
     clues = db.query(Clue).filter(
         Clue.is_overdue == True,
         Clue.status == "active"
@@ -817,8 +827,8 @@ def get_kanban(
     assignee_id: Optional[int] = None,
     db: Session = Depends(get_db)
 ):
-    now = datetime.utcnow()
-    
+    _refresh_overdue(db)
+
     query = db.query(Clue).filter(Clue.status == "active")
     if stage:
         query = query.filter(Clue.stage == stage)
@@ -873,6 +883,8 @@ def daily_report(
     else:
         report_date = date.today()
     
+    _refresh_overdue(db)
+
     start_of_day = datetime.combine(report_date, datetime.min.time())
     end_of_day = datetime.combine(report_date + timedelta(days=1), datetime.min.time())
     

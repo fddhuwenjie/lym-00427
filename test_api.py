@@ -539,6 +539,121 @@ class TestReinitializationPersistence:
         app.dependency_overrides.clear()
 
 
+@pytest.fixture
+def client_and_session():
+    test_app, engine, session_factory = _make_test_app("sqlite://")
+    with TestClient(test_app) as c:
+        yield c, session_factory
+    app.dependency_overrides.clear()
+    engine.dispose()
+
+
+class TestOverdueAutoRefresh:
+    def _make_overdue_candidate(self, client, session_factory):
+        r = client.post("/api/clues", json={
+            "title": "自动刷新逾期线索",
+            "source": "官网", "region": "华北", "priority": "high",
+            "customer_name": "AR", "phone": ""
+        })
+        clue = r.json()
+        future_time = (datetime.utcnow() + timedelta(days=7)).isoformat()
+        client.post(f"/api/clues/{clue['id']}/followup", json={
+            "content": "设置未来跟进时间",
+            "stage_after": "contacted",
+            "next_followup_at": future_time,
+            "created_by": "测试"
+        })
+        db = session_factory()
+        try:
+            db_clue = db.query(Clue).filter(Clue.id == clue["id"]).first()
+            assert db_clue.is_overdue is False, "设置未来时间后不应逾期"
+            past_time = datetime.utcnow() - timedelta(days=2)
+            db_clue.next_followup_at = past_time
+            db.commit()
+        finally:
+            db.close()
+        return clue["id"]
+
+    def test_kanban_auto_refreshes_overdue(self, client_and_session):
+        client, session_factory = client_and_session
+        clue_id = self._make_overdue_candidate(client, session_factory)
+        r = client.get("/api/kanban")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["overdue_count"] >= 1, "看板应自动刷新逾期状态"
+        all_clues = []
+        for stage_clues in data["by_stage"].values():
+            all_clues.extend(stage_clues)
+        clue = next(c for c in all_clues if c["id"] == clue_id)
+        assert clue["is_overdue"] is True
+
+    def test_daily_report_auto_refreshes_overdue(self, client_and_session):
+        client, session_factory = client_and_session
+        clue_id = self._make_overdue_candidate(client, session_factory)
+        r = client.get("/api/reports/daily")
+        assert r.status_code == 200
+        report = r.json()
+        assert report["overdue_clues"] >= 1, "日报应自动刷新逾期状态"
+        clue = next(c for c in report["clues"] if c["id"] == clue_id)
+        assert clue["is_overdue"] is True
+
+    def test_clue_detail_auto_refreshes_overdue(self, client_and_session):
+        client, session_factory = client_and_session
+        clue_id = self._make_overdue_candidate(client, session_factory)
+        r = client.get(f"/api/clues/{clue_id}")
+        assert r.status_code == 200
+        assert r.json()["is_overdue"] is True, "线索详情应自动刷新逾期状态"
+
+    def test_overdue_list_auto_refreshes(self, client_and_session):
+        client, session_factory = client_and_session
+        clue_id = self._make_overdue_candidate(client, session_factory)
+        r = client.get("/api/clues/overdue/list")
+        assert r.status_code == 200
+        overdue = r.json()
+        assert any(c["id"] == clue_id for c in overdue), "逾期列表应自动刷新包含新逾期线索"
+
+    def test_auto_refresh_after_reinit(self, file_db_path):
+        db_url = f"sqlite:///{file_db_path}"
+        clue_id = None
+
+        test_app, engine1, session1 = _make_test_app(db_url)
+        with TestClient(test_app) as c1:
+            r = c1.post("/api/clues", json={
+                "title": "重启后自动刷新逾期",
+                "source": "官网", "region": "华北", "priority": "high",
+                "customer_name": "REINIT", "phone": ""
+            })
+            clue_id = r.json()["id"]
+            future_time = (datetime.utcnow() + timedelta(days=7)).isoformat()
+            c1.post(f"/api/clues/{clue_id}/followup", json={
+                "content": "未来跟进",
+                "stage_after": "contacted",
+                "next_followup_at": future_time,
+                "created_by": "测试"
+            })
+        engine1.dispose()
+        app.dependency_overrides.clear()
+
+        db = session1()
+        try:
+            db_clue = db.query(Clue).filter(Clue.id == clue_id).first()
+            db_clue.next_followup_at = datetime.utcnow() - timedelta(days=1)
+            db.commit()
+        finally:
+            db.close()
+
+        test_app2, engine2, session2 = _make_test_app(db_url)
+        with TestClient(test_app2) as c2:
+            r = c2.get(f"/api/clues/{clue_id}")
+            assert r.json()["is_overdue"] is True, "重启后详情应自动刷新逾期"
+            r2 = c2.get("/api/kanban")
+            assert r2.json()["overdue_count"] >= 1, "重启后看板应自动刷新逾期"
+            r3 = c2.get("/api/clues/overdue/list")
+            assert any(c["id"] == clue_id for c in r3.json()), "重启后逾期列表应自动刷新"
+        engine2.dispose()
+        app.dependency_overrides.clear()
+
+
 class TestEndToEndFlow:
     def test_full_workflow(self, client):
         r = client.post("/api/clues", json={
