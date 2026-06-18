@@ -1,253 +1,595 @@
-import requests
-import json
+import pytest
+import os
+import tempfile
 from datetime import datetime, timedelta
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, StaticPool
+from sqlalchemy.orm import sessionmaker
 
-BASE_URL = "http://localhost:8000"
+from models import Base, init_db, Clue, User, FollowupRecord, AssignmentRule
+from main import app, get_db, get_session_factory
 
-def test_users():
-    print("=" * 60)
-    print("测试1: 获取用户列表")
-    r = requests.get(f"{BASE_URL}/api/users")
-    users = r.json()
-    print(f"  状态码: {r.status_code}")
-    print(f"  用户数: {len(users)}")
-    for u in users:
-        print(f"    - {u['id']}: {u['name']}")
-    return users
 
-def test_assignment_rules():
-    print("\n" + "=" * 60)
-    print("测试2: 获取分派规则")
-    r = requests.get(f"{BASE_URL}/api/assignment-rules")
-    rules = r.json()
-    print(f"  状态码: {r.status_code}")
-    print(f"  规则数: {len(rules)}")
-    for rule in rules:
-        user_name = rule.get('user', {}).get('name', '未知') if rule.get('user') else '未知'
-        print(f"    - {user_name}: 来源={rule['source'] or '全部'}, 地区={rule['region'] or '全部'}, 优先级={rule['priority'] or '全部'}")
-    return rules
+def _make_test_app(db_url: str = "sqlite://"):
+    if db_url == "sqlite://":
+        engine = create_engine(
+            db_url,
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+    else:
+        engine = create_engine(db_url, connect_args={"check_same_thread": False})
+    TestSession = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    init_db(engine, TestSession)
 
-def test_create_clue(title, source, region, priority):
-    print("\n" + "=" * 60)
-    print(f"测试3: 创建线索 - {title}")
-    print(f"  来源: {source}, 地区: {region}, 优先级: {priority}")
-    data = {
-        "title": title,
-        "customer_name": f"客户{title}",
-        "phone": "13800138000",
-        "source": source,
-        "region": region,
-        "priority": priority,
-        "description": f"这是{title}的详细描述"
-    }
-    r = requests.post(f"{BASE_URL}/api/clues", json=data)
-    print(f"  状态码: {r.status_code}")
-    if r.status_code == 200:
+    app.state.engine = engine
+    app.state.session_factory = TestSession
+
+    def _override_get_db():
+        db = TestSession()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_session_factory] = lambda: TestSession
+    return app, engine, TestSession
+
+
+@pytest.fixture
+def client():
+    test_app, engine, session_factory = _make_test_app("sqlite://")
+    with TestClient(test_app) as c:
+        yield c
+    app.dependency_overrides.clear()
+    engine.dispose()
+
+
+@pytest.fixture
+def file_db_path():
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    yield path
+    for f in [path, path + "-shm", path + "-wal"]:
+        if os.path.exists(f):
+            os.unlink(f)
+
+
+class TestAutoAssignment:
+    def test_clue_auto_assigned_on_create(self, client):
+        r = client.post("/api/clues", json={
+            "title": "华北官网高优线索",
+            "customer_name": "测试客户A",
+            "phone": "13800001111",
+            "source": "官网",
+            "region": "华北",
+            "priority": "high",
+            "description": "测试自动分派"
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["assignee_id"] is not None, "线索创建后应自动分派负责人"
+        assert data["assignee_name"] is not None
+        assert data["stage"] == "new"
+
+    def test_assignment_matches_rules(self, client):
+        r = client.post("/api/clues", json={
+            "title": "华北官网高优",
+            "source": "官网", "region": "华北", "priority": "high",
+            "customer_name": "A", "phone": ""
+        })
+        assert r.status_code == 200
+        assert r.json()["assignee_name"] == "张三"
+
+        r = client.post("/api/clues", json={
+            "title": "华东官网高优",
+            "source": "官网", "region": "华东", "priority": "high",
+            "customer_name": "B", "phone": ""
+        })
+        assert r.status_code == 200
+        assert r.json()["assignee_name"] == "李四"
+
+        r = client.post("/api/clues", json={
+            "title": "转介绍高优",
+            "source": "转介绍", "region": "华南", "priority": "high",
+            "customer_name": "C", "phone": ""
+        })
+        assert r.status_code == 200
+        assert r.json()["assignee_name"] == "王五"
+
+        r = client.post("/api/clues", json={
+            "title": "低优先级",
+            "source": "其他", "region": "西南", "priority": "low",
+            "customer_name": "D", "phone": ""
+        })
+        assert r.status_code == 200
+        assert r.json()["assignee_name"] == "赵六"
+
+    def test_kanban_reflects_auto_assignment(self, client):
+        client.post("/api/clues", json={
+            "title": "看板验证线索",
+            "source": "官网", "region": "华北", "priority": "high",
+            "customer_name": "E", "phone": ""
+        })
+        r = client.get("/api/kanban")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["total"] >= 1
+        assert data["today_new"] >= 1
+        new_clues = data["by_stage"]["new"]
+        assert any(c["assignee_name"] is not None for c in new_clues)
+
+
+class TestDuplicateReassignment:
+    def test_reassign_to_same_person_rejected(self, client):
+        r = client.post("/api/clues", json={
+            "title": "转派测试线索",
+            "source": "官网", "region": "华北", "priority": "high",
+            "customer_name": "F", "phone": ""
+        })
         clue = r.json()
-        print(f"  线索ID: {clue['id']}")
-        print(f"  当前阶段: {clue['stage']}")
-        print(f"  负责人: {clue['assignee_name']}")
-        return clue
-    else:
-        print(f"  错误: {r.json()}")
-        return None
+        assignee_id = clue["assignee_id"]
 
-def test_kanban():
-    print("\n" + "=" * 60)
-    print("测试4: 查看看板")
-    r = requests.get(f"{BASE_URL}/api/kanban")
-    data = r.json()
-    print(f"  状态码: {r.status_code}")
-    print(f"  总线索: {data['total']}")
-    print(f"  今日新增: {data['today_new']}")
-    print(f"  今日跟进: {data['today_followup']}")
-    print(f"  逾期数: {data['overdue_count']}")
-    print("  按阶段分布:")
-    for stage, clues in data['by_stage'].items():
-        print(f"    {stage}: {len(clues)} 条")
-        for c in clues[:2]:
-            print(f"      - {c['title']} (负责人: {c['assignee_name']})")
-    return data
+        r2 = client.post(f"/api/clues/{clue['id']}/reassign", json={"target_user_id": assignee_id})
+        assert r2.status_code == 400
+        detail = r2.json()["detail"]
+        assert "已由" in detail or "负责" in detail, f"错误提示应包含当前负责人信息，实际: {detail}"
 
-def test_reassign(clue_id, target_user_id):
-    print("\n" + "=" * 60)
-    print(f"测试5: 转派线索 ID={clue_id} 到用户 ID={target_user_id}")
-    data = {"target_user_id": target_user_id}
-    r = requests.post(f"{BASE_URL}/api/clues/{clue_id}/reassign", json=data)
-    print(f"  状态码: {r.status_code}")
-    result = r.json()
-    if r.status_code == 200:
-        print(f"  转派成功，新负责人: {result['assignee_name']}")
-    else:
-        print(f"  转派被拒绝: {result.get('detail', '未知错误')}")
-    return r.status_code, result
+    def test_reassign_to_different_person_succeeds(self, client):
+        r = client.post("/api/clues", json={
+            "title": "正常转派测试",
+            "source": "官网", "region": "华北", "priority": "high",
+            "customer_name": "G", "phone": ""
+        })
+        clue = r.json()
+        original_assignee = clue["assignee_id"]
 
-def test_followup(clue_id, content, stage_after, next_followup_days=None):
-    print("\n" + "=" * 60)
-    print(f"测试6: 添加跟进记录 - 线索ID={clue_id}")
-    next_time = None
-    if next_followup_days is not None:
-        next_time = (datetime.utcnow() + timedelta(days=next_followup_days)).isoformat()
-    
-    data = {
-        "content": content,
-        "stage_after": stage_after,
-        "next_followup_at": next_time,
-        "created_by": "测试用户"
-    }
-    r = requests.post(f"{BASE_URL}/api/clues/{clue_id}/followup", json=data)
-    print(f"  状态码: {r.status_code}")
-    if r.status_code == 200:
-        record = r.json()
-        print(f"  跟进记录ID: {record['id']}")
-        print(f"  阶段变为: {record['stage_after']}")
-        print(f"  下次跟进: {record['next_followup_at']}")
-        return record
-    else:
-        print(f"  错误: {r.json()}")
-        return None
+        other_user_id = 2 if original_assignee != 2 else 3
+        r2 = client.post(f"/api/clues/{clue['id']}/reassign", json={"target_user_id": other_user_id})
+        assert r2.status_code == 200
+        assert r2.json()["assignee_id"] == other_user_id
 
-def test_overdue():
-    print("\n" + "=" * 60)
-    print("测试7: 检查逾期提醒")
-    r = requests.post(f"{BASE_URL}/api/clues/check-overdue")
-    print(f"  状态码: {r.status_code}")
-    result = r.json()
-    print(f"  新标记逾期: {result['updated']}")
-    print(f"  总逾期数: {result['total_overdue']}")
-    
-    r2 = requests.get(f"{BASE_URL}/api/clues/overdue/list")
-    overdue_list = r2.json()
-    print(f"  逾期线索列表:")
-    for c in overdue_list:
-        print(f"    - {c['title']} (负责人: {c['assignee_name']}, 下次跟进: {c['next_followup_at']})")
-    return result
+    def test_reassign_to_same_person_shows_current_owner_name(self, client):
+        r = client.post("/api/clues", json={
+            "title": "提示负责人测试",
+            "source": "官网", "region": "华北", "priority": "high",
+            "customer_name": "H", "phone": ""
+        })
+        clue = r.json()
+        r2 = client.post(f"/api/clues/{clue['id']}/reassign", json={"target_user_id": clue["assignee_id"]})
+        detail = r2.json()["detail"]
+        assert clue["assignee_name"] in detail, f"提示信息应包含负责人姓名，实际: {detail}"
 
-def test_daily_report():
-    print("\n" + "=" * 60)
-    print("测试8: 日报统计")
-    r = requests.get(f"{BASE_URL}/api/reports/daily")
-    report = r.json()
-    print(f"  状态码: {r.status_code}")
-    print(f"  日期: {report['date']}")
-    print(f"  总线索: {report['total_clues']}")
-    print(f"  今日新增: {report['new_clues']}")
-    print(f"  今日跟进: {report['followed_up']}")
-    print(f"  逾期数: {report['overdue_clues']}")
-    print("  按阶段:")
-    for stage, count in report['by_stage'].items():
-        print(f"    {stage}: {count}")
-    print("  按负责人:")
-    for name, stats in report['by_user'].items():
-        print(f"    {name}: 总数={stats['total']}, 跟进={stats['followed']}, 逾期={stats['overdue']}")
-    return report
 
-def test_export_report():
-    print("\n" + "=" * 60)
-    print("测试9: 导出日报CSV")
-    r = requests.get(f"{BASE_URL}/api/reports/daily/export")
-    print(f"  状态码: {r.status_code}")
-    print(f"  内容类型: {r.headers.get('content-type')}")
-    print(f"  内容长度: {len(r.content)} 字节")
-    lines = r.text.split('\n')
-    print(f"  行数: {len(lines)}")
-    print("  前15行预览:")
-    for i, line in enumerate(lines[:15]):
-        print(f"    {i+1}: {line}")
-    return r.ok
+class TestFollowupUpdates:
+    def test_followup_updates_stage(self, client):
+        r = client.post("/api/clues", json={
+            "title": "跟进阶段测试",
+            "source": "官网", "region": "华东", "priority": "medium",
+            "customer_name": "I", "phone": ""
+        })
+        clue = r.json()
+        assert clue["stage"] == "new"
 
-def test_clue_detail(clue_id):
-    print("\n" + "=" * 60)
-    print(f"测试10: 查看线索详情 ID={clue_id}")
-    r = requests.get(f"{BASE_URL}/api/clues/{clue_id}")
-    clue = r.json()
-    print(f"  状态码: {r.status_code}")
-    print(f"  标题: {clue['title']}")
-    print(f"  阶段: {clue['stage']}")
-    print(f"  负责人: {clue['assignee_name']}")
-    print(f"  最后跟进: {clue['last_followup_at']}")
-    print(f"  下次跟进: {clue['next_followup_at']}")
-    print(f"  是否逾期: {clue['is_overdue']}")
-    print(f"  跟进记录数: {len(clue.get('followups', []))}")
-    return clue
+        next_time = (datetime.utcnow() + timedelta(days=2)).isoformat()
+        r2 = client.post(f"/api/clues/{clue['id']}/followup", json={
+            "content": "首次电话联系，客户表示有兴趣",
+            "stage_after": "contacted",
+            "next_followup_at": next_time,
+            "created_by": "测试"
+        })
+        assert r2.status_code == 200
+        assert r2.json()["stage_after"] == "contacted"
 
-def test_create_overdue_clue():
-    print("\n" + "=" * 60)
-    print("测试: 创建一个过去时间的下次跟进（用于测试逾期）")
-    data = {
-        "title": "逾期测试线索",
-        "customer_name": "逾期客户",
-        "source": "其他",
-        "region": "华中",
-        "priority": "low",
-        "description": "用于测试逾期提醒功能"
-    }
-    r = requests.post(f"{BASE_URL}/api/clues", json=data)
-    clue = r.json()
-    print(f"  创建成功，ID: {clue['id']}")
-    
-    past_time = (datetime.utcnow() - timedelta(days=3)).isoformat()
-    followup_data = {
-        "content": "上次跟进，设置下次跟进为3天前",
-        "stage_after": "contacted",
-        "next_followup_at": past_time,
-        "created_by": "测试"
-    }
-    r2 = requests.post(f"{BASE_URL}/api/clues/{clue['id']}/followup", json=followup_data)
-    print(f"  添加跟进记录，设置过去的下次跟进时间: {r2.status_code}")
-    
-    r3 = requests.post(f"{BASE_URL}/api/clues/check-overdue")
-    result = r3.json()
-    print(f"  逾期检查结果: 新逾期={result['updated']}, 总逾期={result['total_overdue']}")
-    
-    return clue
+        r3 = client.get(f"/api/clues/{clue['id']}")
+        updated = r3.json()
+        assert updated["stage"] == "contacted", "跟进后阶段应更新"
 
-if __name__ == "__main__":
-    print("🎉 线索分派与跟进看板 - 功能验收测试")
-    print("=" * 60)
-    
-    users = test_users()
-    rules = test_assignment_rules()
-    
-    clue1 = test_create_clue("华北官网高优线索", "官网", "华北", "high")
-    clue2 = test_create_clue("华东官网中优线索", "官网", "华东", "medium")
-    clue3 = test_create_clue("转介绍高优线索", "转介绍", "华南", "high")
-    clue4 = test_create_clue("低优先级线索", "其他", "西南", "low")
-    
-    kanban = test_kanban()
-    
-    if clue1 and len(users) >= 2:
-        print("\n" + "=" * 60)
-        print("❗ 测试冲突转派 - 转给同一个人（应被拒绝）")
-        test_reassign(clue1['id'], clue1['assignee_id'])
-        
-        print("\n" + "=" * 60)
-        print("✅ 测试正常转派 - 转给不同的人")
-        other_user_id = 2 if clue1['assignee_id'] != 2 else 3
-        test_reassign(clue1['id'], other_user_id)
-    
-    if clue2:
-        test_followup(clue2['id'], "首次电话联系，客户表示有兴趣", "contacted", 2)
-    
-    if clue3:
-        test_followup(clue3['id'], "详细沟通需求，确认意向", "qualified", 1)
-    
-    overdue_clue = test_create_overdue_clue()
-    
-    test_overdue()
-    
-    test_daily_report()
-    
-    test_export_report()
-    
-    if clue2:
-        test_clue_detail(clue2['id'])
-    
-    print("\n" + "=" * 60)
-    print("🏁 所有测试完成！")
-    print("\n验收要点总结:")
-    print("  ✅ 正常分派后看板更新 - 创建线索后看板显示对应数据")
-    print("  ✅ 重复分派被拦截 - 转派给同一人时返回400错误并提示当前负责人")
-    print("  ✅ 逾期提醒能生成 - 设置过去的下次跟进时间后，检查逾期功能可标记")
-    print("  ✅ 导出日报包含筛选摘要 - CSV包含统计摘要、按阶段、按负责人统计和线索明细")
-    print("  ✅ 重启后可恢复 - 使用SQLite文件数据库，数据持久化")
+    def test_followup_updates_last_followup_time(self, client):
+        r = client.post("/api/clues", json={
+            "title": "跟进时间测试",
+            "source": "官网", "region": "华东", "priority": "medium",
+            "customer_name": "J", "phone": ""
+        })
+        clue = r.json()
+        assert clue["last_followup_at"] is None
+
+        before = datetime.utcnow()
+        r2 = client.post(f"/api/clues/{clue['id']}/followup", json={
+            "content": "添加跟进记录",
+            "stage_after": "contacted",
+            "created_by": "测试"
+        })
+        after = datetime.utcnow()
+        assert r2.status_code == 200
+
+        r3 = client.get(f"/api/clues/{clue['id']}")
+        updated = r3.json()
+        assert updated["last_followup_at"] is not None, "跟进后最后跟进时间应更新"
+        followup_time = datetime.fromisoformat(updated["last_followup_at"])
+        assert before <= followup_time <= after
+
+    def test_kanban_stage_reflects_followup(self, client):
+        r = client.post("/api/clues", json={
+            "title": "看板阶段更新测试",
+            "source": "官网", "region": "华东", "priority": "medium",
+            "customer_name": "K", "phone": ""
+        })
+        clue = r.json()
+
+        client.post(f"/api/clues/{clue['id']}/followup", json={
+            "content": "推进到已联系",
+            "stage_after": "contacted",
+            "created_by": "测试"
+        })
+
+        r2 = client.get("/api/kanban")
+        data = r2.json()
+        contacted_clues = data["by_stage"]["contacted"]
+        assert any(c["id"] == clue["id"] for c in contacted_clues), "看板应反映跟进后的阶段变化"
+
+    def test_kanban_today_followup_increments(self, client):
+        r = client.post("/api/clues", json={
+            "title": "今日跟进计数",
+            "source": "官网", "region": "华东", "priority": "medium",
+            "customer_name": "L", "phone": ""
+        })
+        clue = r.json()
+
+        r_before = client.get("/api/kanban")
+        before_count = r_before.json()["today_followup"]
+
+        client.post(f"/api/clues/{clue['id']}/followup", json={
+            "content": "今日跟进",
+            "stage_after": "contacted",
+            "created_by": "测试"
+        })
+
+        r_after = client.get("/api/kanban")
+        after_count = r_after.json()["today_followup"]
+        assert after_count > before_count, "今日跟进数应在跟进后增加"
+
+
+class TestOverdueReminder:
+    def test_overdue_generated_for_past_followup(self, client):
+        r = client.post("/api/clues", json={
+            "title": "逾期测试线索",
+            "source": "其他", "region": "华中", "priority": "low",
+            "customer_name": "逾期客户", "phone": ""
+        })
+        clue = r.json()
+
+        past_time = (datetime.utcnow() - timedelta(days=3)).isoformat()
+        r2 = client.post(f"/api/clues/{clue['id']}/followup", json={
+            "content": "设置过去的下次跟进时间",
+            "stage_after": "contacted",
+            "next_followup_at": past_time,
+            "created_by": "测试"
+        })
+        assert r2.status_code == 200
+
+        r3 = client.post("/api/clues/check-overdue")
+        assert r3.status_code == 200
+        result = r3.json()
+        assert result["total_overdue"] >= 1, "应有逾期线索"
+
+    def test_overdue_list_contains_clue(self, client):
+        r = client.post("/api/clues", json={
+            "title": "逾期列表测试",
+            "source": "其他", "region": "华中", "priority": "low",
+            "customer_name": "逾期客户2", "phone": ""
+        })
+        clue = r.json()
+
+        past_time = (datetime.utcnow() - timedelta(days=2)).isoformat()
+        client.post(f"/api/clues/{clue['id']}/followup", json={
+            "content": "设置逾期",
+            "stage_after": "contacted",
+            "next_followup_at": past_time,
+            "created_by": "测试"
+        })
+        client.post("/api/clues/check-overdue")
+
+        r2 = client.get("/api/clues/overdue/list")
+        assert r2.status_code == 200
+        overdue = r2.json()
+        assert any(c["id"] == clue["id"] for c in overdue), "逾期列表应包含逾期线索"
+
+    def test_overdue_flag_on_clue_detail(self, client):
+        r = client.post("/api/clues", json={
+            "title": "逾期标记测试",
+            "source": "其他", "region": "华中", "priority": "low",
+            "customer_name": "逾期客户3", "phone": ""
+        })
+        clue = r.json()
+
+        past_time = (datetime.utcnow() - timedelta(days=1)).isoformat()
+        client.post(f"/api/clues/{clue['id']}/followup", json={
+            "content": "设为逾期",
+            "stage_after": "contacted",
+            "next_followup_at": past_time,
+            "created_by": "测试"
+        })
+        client.post("/api/clues/check-overdue")
+
+        r2 = client.get(f"/api/clues/{clue['id']}")
+        assert r2.json()["is_overdue"] is True, "线索详情应标记为逾期"
+
+    def test_kanban_overdue_count_updates(self, client):
+        r = client.post("/api/clues", json={
+            "title": "看板逾期计数",
+            "source": "其他", "region": "华中", "priority": "low",
+            "customer_name": "逾期客户4", "phone": ""
+        })
+        clue = r.json()
+
+        past_time = (datetime.utcnow() - timedelta(days=5)).isoformat()
+        client.post(f"/api/clues/{clue['id']}/followup", json={
+            "content": "设为逾期",
+            "stage_after": "contacted",
+            "next_followup_at": past_time,
+            "created_by": "测试"
+        })
+        client.post("/api/clues/check-overdue")
+
+        r2 = client.get("/api/kanban")
+        assert r2.json()["overdue_count"] >= 1
+
+
+class TestDailyReport:
+    def test_daily_report_contains_summary(self, client):
+        client.post("/api/clues", json={
+            "title": "日报线索A",
+            "source": "官网", "region": "华北", "priority": "high",
+            "customer_name": "RA", "phone": ""
+        })
+        r = client.get("/api/reports/daily")
+        assert r.status_code == 200
+        report = r.json()
+        assert "total_clues" in report
+        assert "new_clues" in report
+        assert "followed_up" in report
+        assert "overdue_clues" in report
+        assert "by_stage" in report
+        assert "by_user" in report
+        assert report["total_clues"] >= 1
+        assert report["new_clues"] >= 1
+
+    def test_daily_report_by_stage(self, client):
+        client.post("/api/clues", json={
+            "title": "阶段统计线索",
+            "source": "官网", "region": "华东", "priority": "medium",
+            "customer_name": "RB", "phone": ""
+        })
+        r = client.get("/api/reports/daily")
+        report = r.json()
+        assert "new" in report["by_stage"]
+        assert report["by_stage"]["new"] >= 1
+
+    def test_daily_report_by_user(self, client):
+        client.post("/api/clues", json={
+            "title": "负责人统计线索",
+            "source": "官网", "region": "华北", "priority": "high",
+            "customer_name": "RC", "phone": ""
+        })
+        r = client.get("/api/reports/daily")
+        report = r.json()
+        assert len(report["by_user"]) >= 1
+        for name, stats in report["by_user"].items():
+            assert "total" in stats
+            assert "followed" in stats
+            assert "overdue" in stats
+
+    def test_export_csv_contains_summary_and_details(self, client):
+        client.post("/api/clues", json={
+            "title": "导出CSV线索",
+            "source": "官网", "region": "华北", "priority": "high",
+            "customer_name": "RD", "phone": ""
+        })
+        r = client.get("/api/reports/daily/export")
+        assert r.status_code == 200
+        assert "text/csv" in r.headers["content-type"]
+        content = r.text
+        assert "统计摘要" in content, "CSV应包含统计摘要"
+        assert "按阶段统计" in content, "CSV应包含按阶段统计"
+        assert "按负责人统计" in content, "CSV应包含按负责人统计"
+        assert "线索明细" in content, "CSV应包含线索明细"
+        assert "导出CSV线索" in content, "CSV线索明细应包含创建的线索"
+
+    def test_export_csv_has_stage_and_overdue_columns(self, client):
+        client.post("/api/clues", json={
+            "title": "CSV字段测试",
+            "source": "官网", "region": "华东", "priority": "medium",
+            "customer_name": "RE", "phone": ""
+        })
+        r = client.get("/api/reports/daily/export")
+        content = r.text
+        lines = content.strip().split("\n")
+        header_found = False
+        for line in lines:
+            if "阶段" in line and "是否逾期" in line:
+                header_found = True
+                break
+        assert header_found, "CSV线索明细应有阶段和是否逾期列头"
+
+    def test_daily_report_includes_clue_details(self, client):
+        client.post("/api/clues", json={
+            "title": "详情测试线索",
+            "source": "转介绍", "region": "华南", "priority": "high",
+            "customer_name": "RF", "phone": "13899998888"
+        })
+        r = client.get("/api/reports/daily")
+        report = r.json()
+        assert "clues" in report
+        assert len(report["clues"]) >= 1
+        clue = next(c for c in report["clues"] if c["title"] == "详情测试线索")
+        assert clue["source"] == "转介绍"
+        assert clue["region"] == "华南"
+        assert clue["customer_name"] == "RF"
+
+
+class TestReinitializationPersistence:
+    def test_data_survives_reinit(self, file_db_path):
+        db_url = f"sqlite:///{file_db_path}"
+
+        test_app, engine1, session1 = _make_test_app(db_url)
+        with TestClient(test_app) as c1:
+            c1.post("/api/clues", json={
+                "title": "持久化测试线索",
+                "source": "官网", "region": "华北", "priority": "high",
+                "customer_name": "P1", "phone": "13800001111"
+            })
+            c1.post("/api/clues", json={
+                "title": "逾期持久化线索",
+                "source": "其他", "region": "华中", "priority": "low",
+                "customer_name": "P2", "phone": ""
+            })
+            clues_before = c1.get("/api/clues").json()
+            overdue_clue_id = next(c["id"] for c in clues_before if c["title"] == "逾期持久化线索")
+            past_time = (datetime.utcnow() - timedelta(days=3)).isoformat()
+            c1.post(f"/api/clues/{overdue_clue_id}/followup", json={
+                "content": "设置逾期跟进",
+                "stage_after": "contacted",
+                "next_followup_at": past_time,
+                "created_by": "测试"
+            })
+            c1.post("/api/clues/check-overdue")
+
+            clue_id = next(c["id"] for c in clues_before if c["title"] == "持久化测试线索")
+            c1.post(f"/api/clues/{clue_id}/followup", json={
+                "content": "持久化跟进记录",
+                "stage_after": "qualified",
+                "created_by": "测试"
+            })
+            original_assignee_id = next(c["assignee_id"] for c in clues_before if c["id"] == clue_id)
+            other_user_id = 2 if original_assignee_id != 2 else 3
+            c1.post(f"/api/clues/{clue_id}/reassign", json={"target_user_id": other_user_id})
+
+        engine1.dispose()
+        app.dependency_overrides.clear()
+
+        test_app2, engine2, session2 = _make_test_app(db_url)
+        with TestClient(test_app2) as c2:
+            clues_after = c2.get("/api/clues").json()
+            assert len(clues_after) >= 2, "重新初始化后线索应保留"
+
+            persisted = next(c for c in clues_after if c["title"] == "持久化测试线索")
+            assert persisted["assignee_id"] == other_user_id, "重新初始化后负责人应保留"
+            assert persisted["stage"] == "qualified", "重新初始化后阶段应保留"
+
+            detail = c2.get(f"/api/clues/{persisted['id']}").json()
+            assert len(detail["followups"]) >= 1, "重新初始化后跟进记录应保留"
+            assert any(f["content"] == "持久化跟进记录" for f in detail["followups"])
+
+            overdue_clue = next(c for c in clues_after if c["title"] == "逾期持久化线索")
+            assert overdue_clue["is_overdue"] is True, "重新初始化后逾期状态应保留"
+
+            users = c2.get("/api/users").json()
+            assert len(users) >= 4, "重新初始化后用户应保留"
+
+            rules = c2.get("/api/assignment-rules").json()
+            assert len(rules) >= 1, "重新初始化后分派规则应保留"
+
+        engine2.dispose()
+        app.dependency_overrides.clear()
+
+    def test_fresh_init_creates_seed_data(self, file_db_path):
+        db_url = f"sqlite:///{file_db_path}"
+
+        test_app, engine, session = _make_test_app(db_url)
+        with TestClient(test_app) as c:
+            users = c.get("/api/users").json()
+            assert len(users) == 4, "初始化应创建4个默认用户"
+            names = [u["name"] for u in users]
+            assert "张三" in names
+            assert "李四" in names
+            assert "王五" in names
+            assert "赵六" in names
+
+            rules = c.get("/api/assignment-rules").json()
+            assert len(rules) >= 1, "初始化应创建默认分派规则"
+
+        engine.dispose()
+        app.dependency_overrides.clear()
+
+    def test_init_idempotent_preserves_data(self, file_db_path):
+        db_url = f"sqlite:///{file_db_path}"
+
+        test_app1, engine1, _ = _make_test_app(db_url)
+        with TestClient(test_app1) as c1:
+            c1.post("/api/clues", json={
+                "title": "幂等测试线索",
+                "source": "官网", "region": "华北", "priority": "high",
+                "customer_name": "IDEM", "phone": ""
+            })
+
+        app.dependency_overrides.clear()
+
+        test_app2, engine2, _ = _make_test_app(db_url)
+        with TestClient(test_app2) as c2:
+            clues = c2.get("/api/clues").json()
+            assert any(c["title"] == "幂等测试线索" for c in clues), "重复初始化不应丢失已有数据"
+            users = c2.get("/api/users").json()
+            assert len(users) == 4, "重复初始化不应重复创建用户"
+
+        engine1.dispose()
+        engine2.dispose()
+        app.dependency_overrides.clear()
+
+
+class TestEndToEndFlow:
+    def test_full_workflow(self, client):
+        r = client.post("/api/clues", json={
+            "title": "端到端流程线索",
+            "source": "官网", "region": "华北", "priority": "high",
+            "customer_name": "E2E", "phone": "13800000000"
+        })
+        clue = r.json()
+        assert clue["assignee_name"] == "张三"
+        assert clue["stage"] == "new"
+
+        r2 = client.post(f"/api/clues/{clue['id']}/reassign", json={"target_user_id": clue["assignee_id"]})
+        assert r2.status_code == 400
+
+        r3 = client.post(f"/api/clues/{clue['id']}/reassign", json={"target_user_id": 2})
+        assert r3.status_code == 200
+        assert r3.json()["assignee_id"] == 2
+
+        next_time = (datetime.utcnow() + timedelta(days=1)).isoformat()
+        r4 = client.post(f"/api/clues/{clue['id']}/followup", json={
+            "content": "首次联系",
+            "stage_after": "contacted",
+            "next_followup_at": next_time,
+            "created_by": "测试"
+        })
+        assert r4.status_code == 200
+
+        r5 = client.get(f"/api/clues/{clue['id']}")
+        detail = r5.json()
+        assert detail["stage"] == "contacted"
+        assert detail["last_followup_at"] is not None
+        assert len(detail["followups"]) == 1
+
+        past_time = (datetime.utcnow() - timedelta(days=2)).isoformat()
+        client.post(f"/api/clues/{clue['id']}/followup", json={
+            "content": "设为逾期",
+            "stage_after": "qualified",
+            "next_followup_at": past_time,
+            "created_by": "测试"
+        })
+        client.post("/api/clues/check-overdue")
+
+        r6 = client.get(f"/api/clues/{clue['id']}")
+        assert r6.json()["is_overdue"] is True
+
+        r7 = client.get("/api/reports/daily")
+        report = r7.json()
+        assert report["total_clues"] >= 1
+        assert report["overdue_clues"] >= 1
+
+        r8 = client.get("/api/reports/daily/export")
+        csv_content = r8.text
+        assert "端到端流程线索" in csv_content
+        assert "统计摘要" in csv_content

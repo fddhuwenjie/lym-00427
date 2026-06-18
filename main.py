@@ -1,5 +1,4 @@
 from fastapi import FastAPI, Depends, HTTPException, Query
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
@@ -9,7 +8,10 @@ import csv
 from io import StringIO
 from fastapi.responses import StreamingResponse
 
-from models import SessionLocal, init_db, Clue, User, FollowupRecord, AssignmentRule
+from models import (
+    Base, SessionLocal, init_db, Clue, User, FollowupRecord, AssignmentRule,
+    create_engine_and_session
+)
 from schemas import (
     ClueCreate, ClueUpdate, ClueResponse, ClueDetailResponse,
     FollowupRecordCreate, FollowupRecordResponse,
@@ -21,9 +23,16 @@ from assignment_engine import auto_assign_clue, validate_reassign
 
 app = FastAPI(title="线索分派与跟进看板", description="FastAPI + SQLite 实现的线索管理系统")
 
+app.state.engine, app.state.session_factory = create_engine_and_session()
+
+
+def get_session_factory():
+    return app.state.session_factory
+
 
 def get_db():
-    db = SessionLocal()
+    factory = get_session_factory()
+    db = factory()
     try:
         yield db
     finally:
@@ -32,8 +41,8 @@ def get_db():
 
 @app.on_event("startup")
 def startup_event():
-    init_db()
-    _check_overdue_internal(SessionLocal())
+    init_db(app.state.engine, app.state.session_factory)
+    _check_overdue_internal(app.state.session_factory)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -753,7 +762,8 @@ def _update_overdue_for_clue(clue: Clue):
         clue.is_overdue = False
 
 
-def _check_overdue_internal(db: Session):
+def _check_overdue_internal(session_factory):
+    db = session_factory()
     try:
         now = datetime.utcnow()
         clues = db.query(Clue).filter(
@@ -807,7 +817,7 @@ def get_kanban(
     assignee_id: Optional[int] = None,
     db: Session = Depends(get_db)
 ):
-    _check_overdue_internal(db)
+    now = datetime.utcnow()
     
     query = db.query(Clue).filter(Clue.status == "active")
     if stage:
@@ -865,8 +875,6 @@ def daily_report(
     
     start_of_day = datetime.combine(report_date, datetime.min.time())
     end_of_day = datetime.combine(report_date + timedelta(days=1), datetime.min.time())
-    
-    _check_overdue_internal(db)
     
     all_clues = db.query(Clue).filter(Clue.status == "active").all()
     

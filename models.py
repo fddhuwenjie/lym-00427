@@ -1,16 +1,12 @@
+import os
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, ForeignKey, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
 
-SQLALCHEMY_DATABASE_URL = "sqlite:///./clue_kanban.db"
+Base = declarable_base = declarative_base()
 
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
-)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-Base = declarative_base()
+DEFAULT_DB_URL = "sqlite:///./clue_kanban.db"
 
 
 class User(Base):
@@ -77,9 +73,25 @@ class FollowupRecord(Base):
     clue = relationship("Clue", back_populates="followups")
 
 
-def init_db():
-    Base.metadata.create_all(bind=engine)
-    db = SessionLocal()
+def create_engine_and_session(db_url: str = None):
+    if db_url is None:
+        db_url = os.environ.get("CLUE_KANBAN_DB_URL", DEFAULT_DB_URL)
+    connect_args = {"check_same_thread": False} if db_url.startswith("sqlite") else {}
+    engine = create_engine(db_url, connect_args=connect_args)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    return engine, SessionLocal
+
+
+engine, SessionLocal = create_engine_and_session()
+
+
+def init_db(engine_instance=None, session_factory=None):
+    if engine_instance is None:
+        engine_instance = engine
+    if session_factory is None:
+        session_factory = SessionLocal
+    Base.metadata.create_all(bind=engine_instance)
+    db = session_factory()
     try:
         if db.query(User).count() == 0:
             users = [
